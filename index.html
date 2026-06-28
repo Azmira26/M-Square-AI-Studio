@@ -1,0 +1,684 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  UploadCloud, 
+  Settings, 
+  Moon, 
+  Sun, 
+  FileText, 
+  Image as ImageIcon, 
+  CheckCircle, 
+  XCircle, 
+  MessageSquare, 
+  ChevronRight, 
+  ChevronDown,
+  Activity,
+  BookOpen,
+  GraduationCap,
+  Microscope,
+  Send,
+  Loader2,
+  Trash2,
+  Network
+} from 'lucide-react';
+
+// --- Utility Functions ---
+const fileToBase64 = (file) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.readAsDataURL(file);
+  reader.onload = () => resolve(reader.result.split(',')[1]);
+  reader.onerror = error => reject(error);
+});
+
+const getFileIcon = (mimeType) => {
+  if (mimeType.startsWith('image/')) return <ImageIcon className="w-4 h-4" />;
+  return <FileText className="w-4 h-4" />;
+};
+
+// --- Gemini API Handler ---
+const generateGeminiContent = async (apiKey, prompt, systemInstruction, filesContext = [], isJson = false) => {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+  
+  const contents = [];
+  
+  // Add files context if provided
+  if (filesContext.length > 0) {
+    const parts = filesContext.map(file => ({
+      inlineData: {
+        mimeType: file.mimeType || 'text/plain', // Fallback for raw text files
+        data: file.data
+      }
+    }));
+    contents.push({ role: 'user', parts });
+  }
+
+  // Add the text prompt
+  contents.push({
+    role: 'user',
+    parts: [{ text: prompt }]
+  });
+
+  const payload = {
+    contents,
+    systemInstruction: {
+      parts: [{ text: systemInstruction }]
+    },
+    generationConfig: {}
+  };
+
+  if (isJson) {
+    payload.generationConfig.responseMimeType = "application/json";
+    // Removed responseSchema to prevent 400 Bad Request errors on deeply nested mindmap schemas.
+    // The JSON structure is now strictly enforced via the text prompt.
+  }
+
+  let retries = 3;
+  let delay = 1000;
+
+  while (retries > 0) {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      
+      const data = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(data.error?.message || 'API Error: Check if file type is supported or API key is valid.');
+      }
+      
+      // Safety checks to prevent "undefined is not an object" errors
+      if (!data || !data.candidates || data.candidates.length === 0) {
+         throw new Error("No candidates returned. The model might have failed to generate a response due to safety blocks.");
+      }
+
+      const candidate = data.candidates[0];
+      if (!candidate.content || !candidate.content.parts || candidate.content.parts.length === 0) {
+         throw new Error(`Content blocked or empty. Finish Reason: ${candidate.finishReason || 'Unknown'}`);
+      }
+      
+      return candidate.content.parts[0].text;
+    } catch (error) {
+      console.error("Gemini API Error:", error.message);
+      retries--;
+      if (retries === 0) throw error;
+      await new Promise(r => setTimeout(r, delay));
+      delay *= 2;
+    }
+  }
+};
+
+// --- Main Component ---
+export default function App() {
+  // Global State
+  const [apiKey, setApiKey] = useState('');
+  const [apiStatus, setApiStatus] = useState('disconnected'); // 'disconnected', 'checking', 'connected', 'error'
+  const [theme, setTheme] = useState('dark');
+  const [teachLevel, setTeachLevel] = useState('Undergrad/Engineer');
+  
+  // Document State
+  const [documents, setDocuments] = useState([]);
+  const [activeDocId, setActiveDocId] = useState(null);
+  const [isUploading, setIsUploading] = useState(false);
+  
+  // Chat State
+  const [chatMessages, setChatMessages] = useState([
+    { role: 'model', text: 'Hello! I am the M² AI Studio Tutor. Upload a document to begin, and I will only answer questions based on the provided text.' }
+  ]);
+  const [chatInput, setChatInput] = useState('');
+  const [isChatting, setIsChatting] = useState(false);
+
+  const fileInputRef = useRef(null);
+  const chatEndRef = useRef(null);
+
+  // Theme effect
+  useEffect(() => {
+    if (theme === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }, [theme]);
+
+  // Auto-scroll chat
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages]);
+
+  const testApiKey = async (key) => {
+    if (!key) {
+      setApiStatus('disconnected');
+      return;
+    }
+    setApiStatus('checking');
+    try {
+      await generateGeminiContent(key, "Hello", "You are a test bot.");
+      setApiStatus('connected');
+    } catch (error) {
+      console.error("API Key Check Failed:", error.message);
+      setApiStatus('error');
+    }
+  };
+
+  const handleApiKeyChange = (e) => {
+    const key = e.target.value;
+    setApiKey(key);
+    // Debounce the API check
+    const timeoutId = setTimeout(() => {
+      testApiKey(key);
+    }, 1000);
+    return () => clearTimeout(timeoutId);
+  };
+
+  const handleFileUpload = async (e) => {
+    const files = Array.from(e.target.files);
+    if (!files.length || apiStatus !== 'connected') {
+      if(apiStatus !== 'connected') alert("Please connect a valid Gemini API Key first.");
+      return;
+    }
+
+    setIsUploading(true);
+    
+    // Allowed MIME types for Gemini inlineData
+    const allowedMimeTypes = ['application/pdf', 'text/plain', 'text/markdown', 'text/csv'];
+    
+    for (const file of files) {
+      // Validate file type (Images, PDFs, and basic text are allowed)
+      const isAllowed = file.type.startsWith('image/') || allowedMimeTypes.includes(file.type);
+      if (!isAllowed) {
+        alert(`Unsupported file type: ${file.name}. The API currently only supports PDF, Images (PNG/JPG/WEBP), and TXT files.`);
+        continue;
+      }
+
+      try {
+        const base64Data = await fileToBase64(file);
+        
+        const docObj = {
+          id: Math.random().toString(36).substring(7),
+          name: file.name,
+          mimeType: file.type || 'text/plain',
+          data: base64Data,
+          analysis: null,
+          status: 'analyzing'
+        };
+        
+        // Optimistic UI update
+        setDocuments(prev => [...prev, docObj]);
+        setActiveDocId(docObj.id);
+
+        // Process Document with highly specific instructions for advanced math and OCR
+        const prompt = `Analyze this document and extract the core mathematical and STEM content. Provide a structured summary.
+IMPORTANT: You MUST respond ONLY with a valid JSON object matching this exact structure:
+{
+  "summary": "String summarizing the document",
+  "keyConcepts": ["Concept 1", "Concept 2"],
+  "formulas": ["Formula 1", "Formula 2"],
+  "definitions": ["Def 1", "Def 2"],
+  "theorems": ["Theorem 1", "Theorem 2"],
+  "conceptFlow": ["Step 1", "Step 2"],
+  "difficulty": "Beginner, Intermediate, Advance, or Research Level",
+  "mindmap": { "name": "Root Concept", "children": [ { "name": "Sub Concept 1", "children": [] } ] }
+}`;
+
+        const systemInstruction = `You are a strict, expert STEM document analyzer capable of reading and understanding highly advanced mathematics (calculus, differential equations, linear algebra, topology, physics, etc.). 
+Perform high-quality OCR on the document/image, accurately capturing complex mathematical equations, symbols, matrices, and theorems. 
+Format all equations and formulas cleanly using standard Unicode characters (e.g., ∫, ∑, ∂, ∞, ∈, ℝ, α, β, ≈) so they are easily readable in plain text without a LaTeX renderer.`;
+        
+        const analysisText = await generateGeminiContent(
+          apiKey, 
+          prompt, 
+          systemInstruction, 
+          [{ mimeType: docObj.mimeType, data: docObj.data }], 
+          true // Request JSON
+        );
+
+        let analysisJson = null;
+        try {
+          analysisJson = JSON.parse(analysisText);
+        } catch (e) {
+          console.error("JSON Parsing failed, attempting extraction", analysisText);
+          const match = analysisText.match(/```json\n([\s\S]*?)\n```/);
+          if (match) analysisJson = JSON.parse(match[1]);
+        }
+
+        setDocuments(prev => prev.map(d => 
+          d.id === docObj.id ? { ...d, status: 'ready', analysis: analysisJson } : d
+        ));
+
+      } catch (error) {
+        console.error("Upload error:", error);
+        setDocuments(prev => prev.map(d => 
+          d.name === file.name ? { ...d, status: 'error' } : d
+        ));
+      }
+    }
+    
+    setIsUploading(false);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleDeleteDoc = (id) => {
+    setDocuments(prev => prev.filter(d => d.id !== id));
+    if (activeDocId === id) setActiveDocId(null);
+  };
+
+  const handleSendMessage = async () => {
+    if (!chatInput.trim() || apiStatus !== 'connected' || documents.length === 0) return;
+
+    const userMessage = chatInput;
+    setChatInput('');
+    setChatMessages(prev => [...prev, { role: 'user', text: userMessage }]);
+    setIsChatting(true);
+
+    try {
+      const activeContext = documents.filter(d => d.status === 'ready');
+      const docNames = activeContext.map(d => d.name).join(', ');
+
+      const systemInstruction = `CRITICAL RAG PROTOCOL: You are the 'M Square AI Research Studio' Math & STEM Tutor. 
+        TEACHING LEVEL: ${teachLevel}. Adapt your explanation depth, vocabulary, and mathematical rigor exactly to this level.
+        If the level is Undergrad/Engineer or Research Level, actively use and explain advanced mathematical notation, rigorous proofs, and complex formulas.
+        
+        RULES:
+        1. You MUST ONLY answer using the facts, formulas, and context provided in the uploaded documents: [${docNames}].
+        2. NEVER use general internet knowledge to answer specific questions.
+        3. If the answer is NOT in the documents, say exactly: "I cannot find the answer to this in the uploaded documents."
+        4. ALWAYS cite references (e.g., "According to [Document Name]" or "As shown in the section about X"). Estimate page numbers if obvious from context.
+        5. Format mathematical equations clearly using readable Unicode math symbols (e.g., ∫, ∑, ∂, ∞, ∈, ℝ, x²). Structure your response with bold headings if needed.`;
+
+      const prompt = `User Question: ${userMessage}\n\nPlease answer based on the provided document context.`;
+
+      const responseText = await generateGeminiContent(
+        apiKey,
+        prompt,
+        systemInstruction,
+        activeContext // Pass all ready documents as context
+      );
+
+      setChatMessages(prev => [...prev, { role: 'model', text: responseText }]);
+
+    } catch (error) {
+      setChatMessages(prev => [...prev, { role: 'model', text: `Error: ${error.message}` }]);
+    } finally {
+      setIsChatting(false);
+    }
+  };
+
+  const activeDoc = documents.find(d => d.id === activeDocId);
+
+  // Helper component for Mindmap rendering
+  const TreeNode = ({ node }) => {
+    const [expanded, setExpanded] = useState(true);
+    if (!node) return null;
+    return (
+      <div className="pl-4 border-l border-slate-300 dark:border-slate-700 ml-2 mt-2">
+        <div 
+          className="flex items-center gap-2 cursor-pointer text-sm font-medium text-slate-800 dark:text-slate-200"
+          onClick={() => setExpanded(!expanded)}
+        >
+          {node.children && node.children.length > 0 ? (
+            expanded ? <ChevronDown className="w-4 h-4 text-slate-500" /> : <ChevronRight className="w-4 h-4 text-slate-500" />
+          ) : (
+            <div className="w-4 h-4" /> // spacer
+          )}
+          <span className="py-1 px-2 bg-slate-100 dark:bg-slate-800 rounded-md border border-slate-200 dark:border-slate-700">
+            {node.name || 'Concept'}
+          </span>
+        </div>
+        {expanded && node.children && (
+          <div className="ml-2">
+            {node.children.map((child, idx) => (
+              <TreeNode key={idx} node={child} />
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className={`flex h-screen w-full font-sans transition-colors duration-300 ${theme === 'dark' ? 'bg-[#0a0a0a] text-slate-200' : 'bg-slate-50 text-slate-900'}`}>
+      
+      {/* LEFT SIDEBAR: Controls & Uploads */}
+      <div className="w-72 border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111] flex flex-col flex-shrink-0 z-10">
+        
+        {/* Header */}
+        <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+          <div>
+            <h1 className="font-bold text-sm tracking-wide">M² AI STUDIO</h1>
+            <p className="text-[10px] text-slate-500 font-mono">MATH & STEM SOLVER</p>
+          </div>
+          <button onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors">
+            {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          </button>
+        </div>
+
+        {/* API Key Section */}
+        <div className="p-4 border-b border-slate-200 dark:border-slate-800 space-y-3 bg-slate-50/50 dark:bg-[#141414]">
+          <div className="flex items-center justify-between">
+            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Gemini API Key</label>
+            <div 
+              className="flex items-center gap-1.5 cursor-help" 
+              title={apiStatus === 'error' ? "API Error. Verify your key or check browser console for details." : ""}
+            >
+              <span className="text-[10px] text-slate-500 uppercase">{apiStatus}</span>
+              <div className={`w-2 h-2 rounded-full ${
+                apiStatus === 'connected' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' :
+                apiStatus === 'checking' ? 'bg-yellow-500 animate-pulse' :
+                apiStatus === 'error' ? 'bg-red-500' : 'bg-slate-300 dark:bg-slate-700'
+              }`} />
+            </div>
+          </div>
+          <input 
+            type="password" 
+            placeholder="AIzaSy..." 
+            value={apiKey}
+            onChange={handleApiKeyChange}
+            className="w-full bg-white dark:bg-black border border-slate-300 dark:border-slate-700 text-sm p-2 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+          />
+        </div>
+
+        {/* Teach Me Mode */}
+        <div className="p-4 border-b border-slate-200 dark:border-slate-800 space-y-3">
+           <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-2">
+            <GraduationCap className="w-3.5 h-3.5" /> Teach Me Mode
+          </label>
+          <select 
+            value={teachLevel}
+            onChange={(e) => setTeachLevel(e.target.value)}
+            className="w-full bg-white dark:bg-black border border-slate-300 dark:border-slate-700 text-sm p-2 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 appearance-none"
+          >
+            <option value="School Level">School Level</option>
+            <option value="High School Level">High School Level</option>
+            <option value="Undergrad/Engineer">Undergrad / Engineer</option>
+            <option value="Research Level">Research Level</option>
+          </select>
+        </div>
+
+        {/* Documents Section */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          <div className="flex items-center justify-between">
+            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Workspace</label>
+            <span className="text-xs text-slate-400 font-mono">{documents.length} Docs</span>
+          </div>
+
+          <button 
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isUploading}
+            className="w-full py-3 px-4 border border-dashed border-slate-300 dark:border-slate-700 rounded-lg flex flex-col items-center justify-center gap-2 hover:bg-slate-50 dark:hover:bg-[#1a1a1a] transition-colors disabled:opacity-50"
+          >
+            {isUploading ? <Loader2 className="w-5 h-5 text-slate-400 animate-spin" /> : <UploadCloud className="w-5 h-5 text-slate-400" />}
+            <span className="text-xs text-slate-500 font-medium text-center">Upload PDF, TXT, or Image</span>
+          </button>
+          <input 
+            type="file" 
+            ref={fileInputRef} 
+            onChange={handleFileUpload} 
+            className="hidden" 
+            multiple 
+            accept=".pdf,.txt,image/*"
+          />
+
+          <div className="space-y-2 mt-4">
+            {documents.map(doc => (
+              <div 
+                key={doc.id}
+                onClick={() => setActiveDocId(doc.id)}
+                className={`group flex items-center justify-between p-2 rounded-md cursor-pointer transition-colors border ${
+                  activeDocId === doc.id 
+                    ? 'bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800/50' 
+                    : 'hover:bg-slate-100 dark:hover:bg-[#1a1a1a] border-transparent'
+                }`}
+              >
+                <div className="flex items-center gap-2 overflow-hidden">
+                  {getFileIcon(doc.mimeType)}
+                  <span className="text-sm truncate max-w-[140px] font-medium">{doc.name}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {doc.status === 'analyzing' && <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500" />}
+                  {doc.status === 'ready' && <CheckCircle className="w-3.5 h-3.5 text-green-500" />}
+                  {doc.status === 'error' && <XCircle className="w-3.5 h-3.5 text-red-500" />}
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); handleDeleteDoc(doc.id); }}
+                    className="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:text-red-500"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* CENTER PANEL: Document Analysis & Mind Map */}
+      <div className="flex-1 flex flex-col min-w-0 bg-white dark:bg-[#0a0a0a]">
+        {activeDoc ? (
+          <div className="flex-1 overflow-y-auto p-8 space-y-8">
+            
+            {/* Header Area */}
+            <div className="flex items-start justify-between border-b border-slate-200 dark:border-slate-800 pb-6">
+              <div>
+                <h2 className="text-2xl font-bold tracking-tight mb-2">{activeDoc.name}</h2>
+                <div className="flex gap-3 text-sm">
+                  <span className="px-2.5 py-1 bg-slate-100 dark:bg-slate-800 rounded-md text-slate-600 dark:text-slate-400 font-mono text-xs flex items-center gap-1">
+                    <Activity className="w-3 h-3" /> Status: {activeDoc.status}
+                  </span>
+                  {activeDoc.analysis?.difficulty && (
+                    <span className="px-2.5 py-1 bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-800/50 rounded-md font-mono text-xs flex items-center gap-1">
+                      <BookOpen className="w-3 h-3" /> Level: {activeDoc.analysis.difficulty}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {activeDoc.status === 'analyzing' && (
+              <div className="flex flex-col items-center justify-center h-64 text-slate-400 space-y-4">
+                <Loader2 className="w-8 h-8 animate-spin" />
+                <p className="text-sm font-mono tracking-widest uppercase">Extracting STEM Entities...</p>
+              </div>
+            )}
+
+            {activeDoc.status === 'ready' && activeDoc.analysis && (
+              <div className="space-y-8 max-w-4xl">
+                
+                {/* Summary Section */}
+                <section>
+                  <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">Document Summary</h3>
+                  <p className="text-slate-800 dark:text-slate-200 leading-relaxed text-sm bg-slate-50 dark:bg-[#111] p-4 rounded-lg border border-slate-100 dark:border-slate-800">
+                    {activeDoc.analysis.summary}
+                  </p>
+                </section>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {/* Key Concepts */}
+                  <section>
+                    <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">Key Math Concepts</h3>
+                    <ul className="space-y-2">
+                      {(activeDoc.analysis.keyConcepts || []).map((concept, i) => (
+                        <li key={i} className="flex items-start gap-2 text-sm">
+                          <span className="text-blue-500 mt-1">•</span>
+                          <span>{concept}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+
+                  {/* Formulas */}
+                  <section>
+                    <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-2">
+                      <Microscope className="w-4 h-4" /> Important Formulas
+                    </h3>
+                    <div className="space-y-2">
+                      {(activeDoc.analysis.formulas || []).map((formula, i) => (
+                        <div key={i} className="font-mono text-sm bg-slate-100 dark:bg-slate-800/50 p-2 rounded border border-slate-200 dark:border-slate-700/50">
+                          {formula}
+                        </div>
+                      ))}
+                      {(!activeDoc.analysis.formulas || activeDoc.analysis.formulas.length === 0) && (
+                        <p className="text-sm text-slate-400 italic">No formulas extracted.</p>
+                      )}
+                    </div>
+                  </section>
+
+                   {/* Theorems */}
+                   <section>
+                    <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">Theorems / Postulates</h3>
+                    <div className="space-y-2">
+                      {(activeDoc.analysis.theorems || []).map((theorem, i) => (
+                        <div key={i} className="text-sm bg-amber-50 dark:bg-amber-900/10 p-3 rounded-md border border-amber-200 dark:border-amber-900/30">
+                          {theorem}
+                        </div>
+                      ))}
+                      {(!activeDoc.analysis.theorems || activeDoc.analysis.theorems.length === 0) && (
+                         <p className="text-sm text-slate-400 italic">No theorems extracted.</p>
+                      )}
+                    </div>
+                  </section>
+
+                  {/* Definitions */}
+                  <section>
+                    <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">Definitions</h3>
+                    <ul className="space-y-2 text-sm">
+                      {(activeDoc.analysis.definitions || []).map((def, i) => (
+                        <li key={i} className="pb-2 border-b border-slate-100 dark:border-slate-800 last:border-0">{def}</li>
+                      ))}
+                    </ul>
+                  </section>
+                </div>
+
+                {/* Concept Flow */}
+                <section>
+                  <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-2">
+                    <Activity className="w-4 h-4" /> Step-by-Step Concept Flow
+                  </h3>
+                  <div className="bg-slate-50 dark:bg-[#111] p-5 rounded-lg border border-slate-100 dark:border-slate-800">
+                    <div className="space-y-4 relative before:absolute before:inset-0 before:ml-4 before:-translate-x-px md:before:mx-auto md:before:translate-x-0 before:h-full before:w-0.5 before:bg-gradient-to-b before:from-transparent before:via-slate-300 dark:before:via-slate-700 before:to-transparent">
+                      {(activeDoc.analysis.conceptFlow || []).map((step, i) => (
+                        <div key={i} className="relative flex items-center justify-between md:justify-normal md:odd:flex-row-reverse group is-active">
+                          <div className="flex items-center justify-center w-8 h-8 rounded-full border border-white dark:border-slate-900 bg-slate-200 dark:bg-slate-700 text-slate-500 dark:text-slate-400 shadow shrink-0 md:order-1 md:group-odd:-translate-x-1/2 md:group-even:translate-x-1/2 z-10 text-xs font-bold">
+                            {i+1}
+                          </div>
+                          <div className="w-[calc(100%-4rem)] md:w-[calc(50%-2.5rem)] bg-white dark:bg-[#1a1a1a] p-3 rounded-md shadow-sm border border-slate-200 dark:border-slate-800 text-sm">
+                            {step}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </section>
+
+                {/* Mind Map */}
+                <section>
+                  <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-2">
+                    <Network className="w-4 h-4" /> Conceptual Mind Map
+                  </h3>
+                  <div className="bg-white dark:bg-[#111] p-6 rounded-lg border border-slate-200 dark:border-slate-800 overflow-x-auto">
+                    {activeDoc.analysis.mindmap ? (
+                      <TreeNode node={activeDoc.analysis.mindmap} />
+                    ) : (
+                      <p className="text-sm text-slate-400 italic">Mind map data unavailable.</p>
+                    )}
+                  </div>
+                </section>
+
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="flex-1 flex flex-col items-center justify-center text-slate-400 dark:text-slate-500">
+            <BookOpen className="w-16 h-16 mb-4 opacity-20" />
+            <p className="font-mono text-sm tracking-widest uppercase">Select or Upload a Document</p>
+          </div>
+        )}
+      </div>
+
+      {/* RIGHT SIDEBAR: RAG Chatbot */}
+      <div className="w-[320px] border-l border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111] flex flex-col flex-shrink-0 shadow-[-4px_0_24px_-10px_rgba(0,0,0,0.1)] z-10">
+        
+        {/* Chat Header */}
+        <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center gap-3">
+          <div className="w-8 h-8 rounded bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center text-blue-600 dark:text-blue-400">
+            <MessageSquare className="w-4 h-4" />
+          </div>
+          <div>
+            <h2 className="font-bold text-sm">Tutor Assistant</h2>
+            <p className="text-[10px] text-slate-500 font-mono">STRICT RAG ENABLED • {teachLevel.toUpperCase()}</p>
+          </div>
+        </div>
+
+        {/* Chat Messages */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-6 bg-slate-50/50 dark:bg-[#0f0f0f]">
+          {chatMessages.map((msg, idx) => (
+            <div key={idx} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+              <div className="flex items-center gap-2 mb-1 px-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  {msg.role === 'user' ? 'You' : 'M² Tutor'}
+                </span>
+              </div>
+              <div 
+                className={`max-w-[85%] p-3 rounded-lg text-sm leading-relaxed ${
+                  msg.role === 'user' 
+                    ? 'bg-blue-600 text-white rounded-tr-none' 
+                    : 'bg-white dark:bg-[#1a1a1a] border border-slate-200 dark:border-slate-800 rounded-tl-none shadow-sm'
+                }`}
+                style={{ wordBreak: 'break-word' }}
+              >
+                {/* Basic rendering, assuming plain text or minor markdown formatting */}
+                {msg.text.split('\n').map((line, i) => (
+                  <span key={i}>
+                    {line.includes('**') ? (
+                       <span dangerouslySetInnerHTML={{ __html: line.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') }} />
+                    ) : line}
+                    <br/>
+                  </span>
+                ))}
+              </div>
+            </div>
+          ))}
+          {isChatting && (
+            <div className="flex items-start">
+              <div className="bg-white dark:bg-[#1a1a1a] border border-slate-200 dark:border-slate-800 p-4 rounded-lg rounded-tl-none shadow-sm flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin text-slate-400" />
+                <span className="text-xs text-slate-400 font-mono">Analyzing documents...</span>
+              </div>
+            </div>
+          )}
+          <div ref={chatEndRef} />
+        </div>
+
+        {/* Chat Input */}
+        <div className="p-4 bg-white dark:bg-[#111] border-t border-slate-200 dark:border-slate-800">
+          <div className="relative">
+            <textarea
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSendMessage();
+                }
+              }}
+              placeholder={documents.length === 0 ? "Upload a document to ask questions..." : "Ask about the document..."}
+              disabled={documents.length === 0 || isChatting}
+              className="w-full bg-slate-50 dark:bg-[#1a1a1a] border border-slate-300 dark:border-slate-700 rounded-lg pl-3 pr-10 py-3 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 resize-none disabled:opacity-50 min-h-[60px] max-h-[150px]"
+              rows="2"
+            />
+            <button
+              onClick={handleSendMessage}
+              disabled={!chatInput.trim() || documents.length === 0 || isChatting}
+              className="absolute right-2 bottom-3 p-1.5 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white rounded-md transition-colors"
+            >
+              <Send className="w-4 h-4" />
+            </button>
+          </div>
+          <p className="text-center mt-2 text-[10px] text-slate-500 uppercase tracking-widest">
+            Press Enter to send
+          </p>
+        </div>
+      </div>
+
+    </div>
+  );
+}
